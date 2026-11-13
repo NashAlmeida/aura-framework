@@ -1,13 +1,17 @@
-"""REST endpoints: health, list tools, run tool."""
+"""REST endpoints: health, list tools, run tool, agent run."""
 
 from fastapi import APIRouter, HTTPException, Request
 
+from app.agent.graph import run_agent
 from app.bridge.executor import (
     ExecutorValidationError,
     ToolNotFoundError,
     execute_tool,
 )
 from app.models.schemas import (
+    AgentRunRequest,
+    AgentRunResponse,
+    AgentToolCall,
     HealthResponse,
     ToolInfo,
     ToolListResponse,
@@ -64,4 +68,34 @@ async def run_tool(payload: ToolRunRequest, request: Request) -> ToolRunResponse
         tool_name=outcome["tool_name"],
         result=outcome.get("result"),
         message=outcome.get("message", ""),
+    )
+
+
+@router.post("/agent/run", response_model=AgentRunResponse)
+async def agent_run(payload: AgentRunRequest, request: Request) -> AgentRunResponse:
+    """Run or resume the Phase 2 LangGraph agent (supports risky-tool confirmation)."""
+    registry = getattr(request.app.state, "tool_registry", None)
+    if registry is None:
+        raise HTTPException(status_code=503, detail="Tool registry is not available")
+
+    try:
+        outcome = await run_agent(
+            payload.message,
+            registry,
+            session_id=payload.session_id,
+            confirmed=payload.confirmed,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Agent failed: {exc}") from exc
+
+    return AgentRunResponse(
+        status=outcome.get("status") or "completed",
+        response=outcome.get("response") or "",
+        tool_calls=[AgentToolCall(**tc) for tc in outcome.get("tool_calls") or []],
+        session_id=outcome["session_id"],
+        tool_name=outcome.get("tool_name"),
+        arguments=outcome.get("arguments"),
+        message=outcome.get("message"),
     )
