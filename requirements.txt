@@ -9,6 +9,8 @@ langgraph>=0.2.0
 langchain>=0.3.0
 langchain-core>=0.3.0
 langchain-openai>=0.2.0
+# Langfuse tracing (LangChain / LangGraph CallbackHandler). SDK v5 needs Python >= 3.11.
+langfuse>=5
 # Phase 3 — web frontend
 streamlit>=1.39.0
 httpx>=0.27.0

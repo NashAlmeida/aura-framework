@@ -108,6 +108,14 @@ def test_run_tool_simulated_success(client: TestClient) -> None:
     assert body["result"]["arguments"]["url"] == "https://example.com"
 
 
+def test_tracing_disabled_without_keys(monkeypatch) -> None:
+    monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
+    monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
+    from app.agent.tracing import tracing_enabled
+
+    assert tracing_enabled() is False
+
+
 def test_agent_run_demo(client: TestClient) -> None:
     _inject_open_url()
     response = client.post(

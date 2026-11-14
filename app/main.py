@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.agent.tracing import shutdown_tracing
 from app.api.routes import router as api_router
 from app.api.websocket import router as ws_router
 from app.bridge.tool_registry import ToolRegistry
@@ -17,6 +18,7 @@ async def lifespan(app: FastAPI):
     registry.load()
     app.state.tool_registry = registry
     yield
+    shutdown_tracing()
 
 
 app = FastAPI(

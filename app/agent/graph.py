@@ -29,6 +29,7 @@ from langgraph.types import Command, interrupt
 
 from app.agent.memory import ShortTermMemory, memory_store
 from app.agent.tools import build_langchain_tools, is_risky_tool
+from app.agent.tracing import ainvoke_traced
 from app.bridge.tool_registry import ToolRegistry
 from app.config import settings
 
@@ -361,13 +362,20 @@ async def run_agent(
     """
     memory = memory or memory_store
     session_id = session_id or str(uuid.uuid4())
+    # thread_id stays on the graph config inside ainvoke_traced.
     config = {"configurable": {"thread_id": session_id}}
 
     graph = build_agent_graph(registry)
 
     # --- Resume after human confirmation ---
     if confirmed is not None:
-        result = await graph.ainvoke(Command(resume=bool(confirmed)), config)
+        result = await ainvoke_traced(
+            graph,
+            Command(resume=bool(confirmed)),
+            session_id=session_id,
+            run_name="confirm-agent-run",
+            trace_input={"confirmed": bool(confirmed), "session_id": session_id},
+        )
         payload = _interrupt_payload(result, graph, config)
         if payload is not None:
             # Another risky step may be waiting (unlikely with one-at-a-time plans).
@@ -433,7 +441,14 @@ async def run_agent(
     # Remember the user turn immediately so confirmation pauses keep context.
     memory.append(session_id, "user", message)
 
-    result = await graph.ainvoke({"messages": history_msgs}, config)
+    result = await ainvoke_traced(
+        graph,
+        {"messages": history_msgs},
+        session_id=session_id,
+        run_name="run-agent",
+        # Trace input is the user message only — not history or API keys.
+        trace_input={"message": message},
+    )
     payload = _interrupt_payload(result, graph, config)
     messages = list((result or {}).get("messages") or [])
 

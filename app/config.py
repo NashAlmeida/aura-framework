@@ -1,8 +1,15 @@
-"""Application settings loaded from environment / .env."""
+"""Application settings loaded from environment / .env.
+
+``load_dotenv()`` runs first so Langfuse (which reads ``os.environ`` itself)
+sees LANGFUSE_* before any Langfuse client is imported.
+"""
 
 from pathlib import Path
 
+from dotenv import load_dotenv
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+load_dotenv()
 
 
 class Settings(BaseSettings):

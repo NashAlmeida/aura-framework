@@ -78,6 +78,19 @@ curl -X POST http://127.0.0.1:8000/agent/run ^
 streamlit run frontend/app.py
 ```
 
+## Langfuse tracing
+
+Agent turns and tool calls are traced when both keys are set in `.env` (copied from `.env.example`). Keys stay in `.env` — do not commit them.
+
+```env
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_BASE_URL=https://cloud.langfuse.com
+LANGFUSE_TRACING_ENVIRONMENT=development
+```
+
+Restart the API, then send `POST /agent/run`. Open the Langfuse project **Traces** view and filter by name `run-agent`. The same `session_id` groups a confirmation resume (`confirm-agent-run`) under **Sessions**.
+
 ## Status
 
 Phase 1 bridge + Phase 2 multi-step agent (HITL) + Phase 3 Streamlit UI.
