@@ -1,4 +1,4 @@
-# Aura Framework guide
+# Aura Framework guide (still in development phase) 
 
 Local web-agent bridge that discovers **Mark-LVII** tools, runs a LangGraph agent over them, and exposes a Streamlit chat UI.
 
