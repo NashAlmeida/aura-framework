@@ -40,6 +40,11 @@ SYSTEM_PROMPT = (
     "Use the available tools when the user asks to open apps, URLs, search, or run actions. "
     "You may call multiple tools across turns to complete a multi-step request. "
     "Prefer calling tools over guessing. Keep final answers short and clear. "
+    "When the user asks to open a new tab, open Chrome, or search in the browser, "
+    "call web_search and also browser_control. For browser_control use action "
+    "'new_tab' with an https URL: the first result link, or a Google search URL "
+    "if there is no result link. action 'search' with a query is also fine. "
+    "Do not click, type, or close tabs. "
     "Risky tools (delete/send/shutdown/etc.) require human confirmation before they run."
 )
 
@@ -60,14 +65,148 @@ def _completed_tool_count(messages: list[BaseMessage]) -> int:
     return sum(1 for msg in messages if isinstance(msg, ToolMessage))
 
 
+_SEARCH_NOISE = (
+    "open a new tab and",
+    "open new tab and",
+    "open a new tab",
+    "open new tab",
+    "open chrome and",
+    "open chrome then",
+    "open chrome",
+    "open the browser and",
+    "open browser and",
+    "open the browser",
+    "open browser",
+    "in the browser",
+    "in a browser",
+    "in browser",
+    "in chrome",
+    "search the web for",
+    "search for",
+    "look up",
+    "search",
+    "please",
+)
+
+
+def _wants_browser_open(text: str) -> bool:
+    """True when the user asked for a tab or a browser, not just a search."""
+    return any(
+        phrase in text
+        for phrase in (
+            "new tab",
+            "open tab",
+            "open chrome",
+            "open browser",
+            "open the browser",
+            "in browser",
+            "in chrome",
+            "in a browser",
+            "in the browser",
+        )
+    )
+
+
+def _extract_search_query(user_text: str) -> str:
+    """Pull the search terms out of an open-tab / search sentence."""
+    query = re.split(r"\bthen\b|\band then\b", user_text, maxsplit=1, flags=re.IGNORECASE)[0]
+    for noise in _SEARCH_NOISE:
+        query = re.sub(rf"\b{re.escape(noise)}\b", " ", query, flags=re.IGNORECASE)
+    query = re.sub(r"\s+", " ", query).strip(" .,-")
+    return query or "python tutorials"
+
+
+def _first_result_url(messages: list[BaseMessage]) -> str | None:
+    """First http(s) link from an earlier tool result, skipping search pages."""
+    skip = ("google.com/search", "duckduckgo.com/", "bing.com/search")
+    for msg in messages:
+        if not isinstance(msg, ToolMessage):
+            continue
+        for match in re.finditer(r"https?://[^\s\"'\\<>]+", str(msg.content)):
+            url = match.group(0).rstrip(".,);]")
+            if any(host in url.lower() for host in skip):
+                continue
+            return url
+    return None
+
+
+def _browser_call_args(step: dict[str, Any], messages: list[BaseMessage]) -> dict[str, Any]:
+    """Use the top web_search link when one exists; otherwise the planned URL."""
+    args = dict(step.get("args") or {})
+    if not step.get("open_top_result"):
+        return args
+    found = _first_result_url(messages)
+    if not found:
+        return args
+    opened = {"action": "new_tab", "url": found}
+    if args.get("browser"):
+        opened["browser"] = args["browser"]
+    return opened
+
+
 def _build_demo_plan(user_text: str, tool_names: set[str]) -> list[dict[str, Any]]:
     """Turn a natural-language request into an ordered list of tool steps."""
     text = user_text.lower()
     plan: list[dict[str, Any]] = []
 
-    wants_open_or_search = any(
-        key in text for key in ("open", "chrome", "browser", "url", "search", "http")
+    wants_weather = "weather" in text
+    if "weather_report" in tool_names and wants_weather:
+        city = "Mumbai"
+        match = re.search(
+            r"(?:weather(?:\s+report)?|forecast)\s+(?:in|for|at)\s+([A-Za-z][A-Za-z .'-]{1,40})",
+            user_text,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            city = match.group(1).strip(" .")
+        plan.append({"name": "weather_report", "args": {"city": city}})
+
+    wants_desktop_list = "desktop" in text and any(
+        key in text for key in ("list", "files", "what", "show")
     )
+    if "desktop_control" in tool_names and wants_desktop_list:
+        plan.append({"name": "desktop_control", "args": {"action": "list"}})
+
+    wants_web_search = "search" in text or "look up" in text
+    if "web_search" in tool_names and wants_web_search and not wants_weather:
+        query = _extract_search_query(user_text)
+        plan.append({"name": "web_search", "args": {"query": query, "mode": "search"}})
+
+    wants_browser = _wants_browser_open(text)
+    explicit_url = None
+    url_match = re.search(r"https?://\S+", user_text)
+    if url_match:
+        explicit_url = url_match.group(0).rstrip(".,)")
+    if (
+        "browser_control" in tool_names
+        and wants_browser
+        and (wants_web_search or explicit_url)
+    ):
+        browser = "chrome" if "chrome" in text else None
+        if explicit_url and not wants_web_search:
+            args = {"action": "new_tab", "url": explicit_url}
+            open_top_result = False
+        else:
+            query = _extract_search_query(user_text)
+            args = {
+                "action": "new_tab",
+                "url": f"https://www.google.com/search?q={quote_plus(query)}",
+            }
+            open_top_result = True
+        if browser:
+            args["browser"] = browser
+        plan.append(
+            {
+                "name": "browser_control",
+                "args": args,
+                "open_top_result": open_top_result,
+            }
+        )
+
+    planned = {step["name"] for step in plan}
+    wants_open_or_search = any(
+        key in text for key in ("open", "chrome", "browser", "url", "http")
+    ) and "web_search" not in planned and "browser_control" not in planned
     if "open_url" in tool_names and wants_open_or_search:
         url = "https://www.google.com"
         if "search" in text:
@@ -130,6 +269,7 @@ def _demo_agent_node(tools: list[BaseTool]):
 
         if plan and done < len(plan):
             step = plan[done]
+            args = _browser_call_args(step, messages)
             return {
                 "messages": [
                     AIMessage(
@@ -137,7 +277,7 @@ def _demo_agent_node(tools: list[BaseTool]):
                         tool_calls=[
                             {
                                 "name": step["name"],
-                                "args": step.get("args") or {},
+                                "args": args,
                                 "id": f"demo_{step['name']}_{uuid.uuid4().hex[:8]}",
                                 "type": "tool_call",
                             }

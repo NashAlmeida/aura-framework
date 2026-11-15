@@ -19,6 +19,9 @@ copy .env.example .env
 
 ```bash
 # Terminal 1 — FastAPI bridge (port 8000)
+# Point MARK_LVII_PATH at the cloned Mark-LVII tree (the folder that contains actions/).
+# Windows PowerShell:
+#   $env:MARK_LVII_PATH = "D:\path\to\mark_lvii"
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 
 # Terminal 2 — Streamlit UI (port 8501)
@@ -39,9 +42,38 @@ streamlit run frontend/app.py
 
 ## Phase 1 — Bridge
 
-- Tool discovery from `mark_lvii/actions` and `plugins`
-- Simulated `POST /tools/run`
-- WebSocket status at `ws://127.0.0.1:8000/ws`
+- Tool discovery from `mark_lvii/actions` and `plugins` (no import during discovery)
+- `POST /tools/run` and the agent both go through `execute_tool`
+- WebSocket status at `ws://127.0.0.1:8000/ws` (`tool_started` / `tool_finished`, including `mode`)
+
+### Real vs simulated execution
+
+Only a small allowlist calls the Mark-LVII handler. Logs say `mode=real` or `mode=simulated`.
+
+| Tool | Runs for real when |
+| --- | --- |
+| `weather_report` | always |
+| `web_search` | always |
+| `desktop_control` | `action` is `list` |
+| `browser_control` | `go_to`, `search`, or `new_tab` with an `http(s)` URL (or a query for `search`) |
+
+Everything else stays simulated. Browser click, type, and close stay simulated. Risky tools (`delete_file`, `send_message`, shutdown, and similar names) still pause for confirmation before they run, and the run itself stays simulated.
+
+`browser_control` opens the address in the user's normal browser. It does not attach Playwright for these three actions.
+
+## Opening a browser tab
+
+The demo planner (no `OPENAI_API_KEY`) treats these as two steps: `web_search`, then `browser_control` `new_tab`.
+
+- `open new tab and search griezmann`
+- `open chrome and search python tutorials`
+- `search griezmann in browser`
+
+If the search returns a link, that link is opened. Otherwise the tab is a Google search for the same query. “Chrome” in the request passes `browser=chrome`. A plain search with no tab/browser wording only calls `web_search`.
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/agent/run -Method Post -ContentType "application/json" -Body '{"message":"open new tab and search griezmann","session_id":"demo-tab"}'
+```
 
 ## Phase 2 — Agent
 
@@ -71,8 +103,8 @@ curl -X POST http://127.0.0.1:8000/agent/run ^
 - Dot-matrix font (`VT323` / Share Tech Mono)
 - Light (white) / dark (**charcoal grey**) theme toggle
 - Square sharp-cornered buttons
-- Chat → `/agent/run` with Confirm / Cancel for risky tools
-- Optional live WebSocket status in the sidebar
+- Chat → `POST /agent/run`, with Confirm / Cancel when the status is `needs_confirmation`
+- Sidebar WebSocket status, including whether a tool ran `real` or `simulated`
 
 ```bash
 streamlit run frontend/app.py
@@ -93,4 +125,4 @@ Restart the API, then send `POST /agent/run`. Open the Langfuse project **Traces
 
 ## Status
 
-Phase 1 bridge + Phase 2 multi-step agent (HITL) + Phase 3 Streamlit UI.
+Phase 1 bridge + Phase 2 multi-step agent (HITL) + Phase 3 Streamlit UI. Safe Mark-LVII tools (`weather_report`, `web_search`, desktop list, and browser open/search/new-tab) execute for real; other tools stay simulated.

@@ -116,6 +116,20 @@ def test_tracing_disabled_without_keys(monkeypatch) -> None:
     assert tracing_enabled() is False
 
 
+def test_open_tab_plan_uses_search_and_browser() -> None:
+    from app.agent.graph import _build_demo_plan
+
+    plan = _build_demo_plan(
+        "open new tab and search griezmann",
+        {"web_search", "browser_control", "send_message", "delete_file"},
+    )
+    assert [step["name"] for step in plan] == ["web_search", "browser_control"]
+    assert plan[0]["args"]["query"] == "griezmann"
+    assert plan[1]["args"]["action"] == "new_tab"
+    assert "griezmann" in plan[1]["args"]["url"]
+    assert plan[1]["args"]["url"].startswith("https://")
+
+
 def test_agent_run_demo(client: TestClient) -> None:
     _inject_open_url()
     response = client.post(

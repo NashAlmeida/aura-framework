@@ -1,13 +1,21 @@
 """Safely executes a Mark-LVII tool call.
 
-Phase 1: look up the tool in the registry and *simulate* execution.
-Real Mark-LVII imports/runs come later (deps may be missing).
+Safe allowlist runs the real Mark-LVII handler:
+  weather_report, web_search,
+  desktop_control when action=list,
+  browser_control when action is go_to, search, or new_tab
+  and the target is an http(s) address or a search query.
+Every other tool, including browser click/type/close, stays simulated.
 """
 
 from __future__ import annotations
 
+import asyncio
+import importlib.util
+import inspect
 import json
 import logging
+import sys
 from datetime import datetime, timezone
 from typing import Any, TYPE_CHECKING
 
@@ -18,11 +26,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Reject argument payloads larger than this (serialized JSON size in bytes).
 MAX_ARGUMENTS_BYTES = 50_000
-
-# Characters / sequences that must never appear in a tool name (path traversal).
 _UNSAFE_NAME_MARKERS = ("..", "/", "\\")
+
+# Tools that may call Mark-LVII for real. desktop_control and browser_control
+# are special-cased so only their read-or-open actions run.
+REAL_TOOL_NAMES = frozenset({"weather_report", "web_search"})
+BROWSER_OPEN_ACTIONS = frozenset({"go_to", "search", "new_tab"})
+REAL_TIMEOUT_SECONDS = 25
 
 
 class ExecutorValidationError(Exception):
@@ -40,6 +51,28 @@ class ToolNotFoundError(Exception):
         self.tool_name = tool_name
         self.message = f"Tool not found: {tool_name}"
         super().__init__(self.message)
+
+
+def _http_url(value: Any) -> bool:
+    url = str(value or "").strip().lower()
+    return url.startswith("https://") or url.startswith("http://")
+
+
+def allows_real_execution(tool_name: str, arguments: dict[str, Any] | None) -> bool:
+    """True only for the safe allowlist."""
+    arguments = arguments or {}
+    if tool_name in REAL_TOOL_NAMES:
+        return True
+    if tool_name == "desktop_control":
+        return str(arguments.get("action") or "").strip().lower() == "list"
+    if tool_name == "browser_control":
+        action = str(arguments.get("action") or "").strip().lower()
+        if action not in BROWSER_OPEN_ACTIONS:
+            return False
+        if action == "search":
+            return bool(str(arguments.get("query") or "").strip())
+        return _http_url(arguments.get("url"))
+    return False
 
 
 def _utc_now_iso() -> str:
@@ -75,64 +108,153 @@ def _validate_arguments(arguments: dict[str, Any]) -> None:
         )
 
 
+def _load_handler(registry: "ToolRegistry", source: str):
+    """Import one Mark-LVII file and return its TOOL handler."""
+    path = (registry.mark_lvii_path / source).resolve()
+    root = registry.mark_lvii_path.resolve()
+    if not path.is_file() or root not in path.parents:
+        raise FileNotFoundError(f"Mark-LVII source not found: {source}")
+
+    root_str = str(root)
+    if root_str not in sys.path:
+        sys.path.insert(0, root_str)
+
+    module_name = "aura_lvii_" + path.stem
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"could not import {source}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+
+    tool = getattr(module, "TOOL", None)
+    handler = tool.get("handler") if isinstance(tool, dict) else None
+    if not callable(handler):
+        handler = getattr(module, "run", None)
+    if not callable(handler):
+        raise RuntimeError(f"{source} has no callable TOOL handler")
+    return handler
+
+
+def _invoke_handler(handler, arguments: dict[str, Any]) -> str:
+    """Call a Mark-LVII handler with only the arguments it declares."""
+    sig = inspect.signature(handler)
+    names = list(sig.parameters)
+    if names and names[0] == "parameters":
+        extra = {
+            key: None
+            for key in ("player", "speak", "response", "session_memory")
+            if key in sig.parameters
+        }
+        result = handler(arguments, **extra)
+    elif "parameters" in sig.parameters:
+        result = handler(parameters=arguments)
+    else:
+        result = handler(arguments)
+    text = result if isinstance(result, str) else str(result)
+    if len(text) > 4000:
+        text = text[:4000] + "…"
+    return text
+
+
+def _run_real(registry: "ToolRegistry", tool: dict[str, Any], arguments: dict[str, Any]) -> str:
+    handler = _load_handler(registry, tool.get("source") or "")
+    return _invoke_handler(handler, arguments)
+
+
 async def execute_tool(
     tool_name: str,
     arguments: dict,
     *,
     registry: "ToolRegistry",
 ) -> dict:
-    """Look up a tool and return a simulated execution result.
-
-    Does **not** import or run Mark-LVII code yet.
-    Broadcasts `tool_started` / `tool_finished` over the WebSocket manager.
-
-    Returns:
-        {
-          "success": true,
-          "tool_name": "...",
-          "result": { "arguments": {...}, "source": "..." },
-          "message": "simulated execution — Mark-LVII integration pending"
-        }
-
-    Raises:
-        ExecutorValidationError: unsafe tool_name or oversized arguments
-        ToolNotFoundError: tool is not registered
-    """
+    """Run an allowlisted tool for real, or simulate everything else."""
     arguments = arguments or {}
 
-    # --- safety gates (always run before registry lookup) ---
     _validate_tool_name(tool_name)
     _validate_arguments(arguments)
     tool_name = tool_name.strip()
 
     tool = registry.get_tool(tool_name)
     if tool is None:
-        logger.info("execute_tool: tool=%s success=%s", tool_name, False)
+        logger.info("execute_tool: tool=%s mode=missing success=%s", tool_name, False)
         raise ToolNotFoundError(tool_name)
 
-    # Notify live clients that work is starting.
+    real = allows_real_execution(tool_name, arguments)
+    mode = "real" if real else "simulated"
     await manager.broadcast(
         {
             "type": "tool_started",
             "tool_name": tool_name,
+            "mode": mode,
             "timestamp": _utc_now_iso(),
         }
     )
 
     success = True
     try:
-        # Simulated result — real dispatch into Mark-LVII comes in a later phase.
-        result = {
-            "arguments": arguments,
-            "source": tool.get("source", ""),
-            "simulated": True,
-        }
-        response = {
-            "success": True,
-            "tool_name": tool_name,
-            "result": result,
-            "message": "simulated execution — Mark-LVII integration pending",
-        }
+        if real:
+            logger.info("execute_tool: tool=%s mode=real starting", tool_name)
+            if tool_name == "browser_control":
+                logger.info(
+                    "browser tool running for real: action=%s url=%s query=%s browser=%s",
+                    arguments.get("action"),
+                    arguments.get("url") or "",
+                    arguments.get("query") or "",
+                    arguments.get("browser") or "default",
+                )
+            try:
+                output = await asyncio.wait_for(
+                    asyncio.to_thread(_run_real, registry, tool, arguments),
+                    timeout=REAL_TIMEOUT_SECONDS,
+                )
+            except Exception as exc:
+                success = False
+                logger.exception("execute_tool: tool=%s mode=real success=%s", tool_name, False)
+                response = {
+                    "success": False,
+                    "tool_name": tool_name,
+                    "result": {
+                        "arguments": arguments,
+                        "source": tool.get("source", ""),
+                        "simulated": False,
+                        "error": str(exc),
+                    },
+                    "message": f"real execution failed: {exc}",
+                }
+            else:
+                logger.info("execute_tool: tool=%s mode=real success=%s", tool_name, True)
+                response = {
+                    "success": True,
+                    "tool_name": tool_name,
+                    "result": {
+                        "arguments": arguments,
+                        "source": tool.get("source", ""),
+                        "simulated": False,
+                        "output": output,
+                    },
+                    "message": "real execution",
+                }
+        else:
+            reason = "simulated execution — not on the safe allowlist"
+            if tool_name == "desktop_control":
+                reason = "simulated execution — desktop_control is real only for action=list"
+            elif tool_name == "browser_control":
+                reason = (
+                    "simulated execution — browser_control is real only for "
+                    "go_to, search, and new_tab with an http(s) address"
+                )
+            logger.info("execute_tool: tool=%s mode=simulated success=%s", tool_name, True)
+            response = {
+                "success": True,
+                "tool_name": tool_name,
+                "result": {
+                    "arguments": arguments,
+                    "source": tool.get("source", ""),
+                    "simulated": True,
+                },
+                "message": reason,
+            }
     except Exception:
         success = False
         raise
@@ -141,10 +263,10 @@ async def execute_tool(
             {
                 "type": "tool_finished",
                 "tool_name": tool_name,
+                "mode": mode,
                 "success": success,
                 "timestamp": _utc_now_iso(),
             }
         )
 
-    logger.info("execute_tool: tool=%s success=%s", tool_name, True)
     return response

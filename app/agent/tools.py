@@ -102,7 +102,10 @@ def _make_bridge_tool(spec: dict[str, Any], registry: ToolRegistry) -> Structure
     args_schema = _args_schema_for(tool_name, parameters)
 
     async def _run(**kwargs: Any) -> str:
+        # Every agent tool goes through the bridge executor.
+        # The executor decides real vs simulated from the safe allowlist.
         arguments = {k: v for k, v in kwargs.items() if v not in ("", None)}
+        logger.info("agent tool %s -> execute_tool", tool_name)
         try:
             outcome = await execute_tool(tool_name, arguments, registry=registry)
         except (ExecutorValidationError, ToolNotFoundError) as exc:
