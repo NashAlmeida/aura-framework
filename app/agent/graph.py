@@ -29,6 +29,7 @@ from langgraph.types import Command, interrupt
 
 from app.agent.memory import ShortTermMemory, memory_store
 from app.agent.tools import build_langchain_tools, is_risky_tool
+from app.bridge.executor import file_action_needs_confirmation
 from app.agent.tracing import ainvoke_traced
 from app.bridge.tool_registry import ToolRegistry
 from app.config import settings
@@ -46,7 +47,9 @@ SYSTEM_PROMPT = (
     "if there is no result link. action 'search' with a query is also fine. "
     "Do not click, type, or close tabs. "
     "For file questions, use file_controller list or disk_usage on a home shortcut "
-    "(desktop, downloads, documents, home). Do not read, write, or delete files. "
+    "(desktop, downloads, documents, home). Create new .py, .txt, or .md files "
+    "only inside cache/ with create_file. Do not read, overwrite, or delete files, "
+    "and do not write outside cache/. "
     "After the tools finish, answer in one or two short sentences. Lead with the "
     "result. Do not paste raw JSON or the full tool payload. "
     "Risky tools (delete/send/shutdown/etc.) require human confirmation before they run."
@@ -148,6 +151,57 @@ def _browser_call_args(step: dict[str, Any], messages: list[BaseMessage]) -> dic
     return opened
 
 
+def _cache_file_step(user_text: str) -> dict[str, Any] | None:
+    """Plan a new cache/ file when the user asks to create one."""
+    text = user_text.lower()
+    wants_create = any(
+        phrase in text
+        for phrase in ("create", "make a file", "write a file", "save a file")
+    ) or (
+        "make a" in text
+        and any(kind in text for kind in ("python", "script", "file", ".py", ".txt", ".md"))
+    )
+    if not wants_create:
+        return None
+    match = re.search(r"\b([A-Za-z0-9_\-]+\.(?:py|txt|md))\b", user_text, flags=re.IGNORECASE)
+    if match:
+        name = match.group(1)
+        ext = name.rsplit(".", 1)[-1].lower()
+    elif "python" in text or "script" in text:
+        name = "current_time.py" if "time" in text else "hello_world.py"
+        ext = "py"
+    elif "note" in text:
+        name = "notes.txt"
+        ext = "txt"
+    else:
+        return None
+    said = re.search(
+        r"(?:that says|with content|containing)\s+(.+)$",
+        user_text,
+        flags=re.IGNORECASE,
+    )
+    if said:
+        content = said.group(1).strip().strip("\"'")
+        if not content.endswith("\n"):
+            content += "\n"
+    elif ext == "py" and "time" in text:
+        content = "from datetime import datetime\nprint(datetime.now().isoformat())\n"
+    elif ext == "py" and "hello world" in text:
+        content = 'print("hello world")\n'
+    elif ext == "py":
+        content = 'print("hello")\n'
+    elif "note" in text:
+        content = "Aura Framework project note.\n"
+    else:
+        content = "hello\n"
+    outside = any(folder in text for folder in ("desktop", "download", "document", "picture"))
+    path = "desktop" if outside and "cache" not in text else "cache"
+    return {
+        "name": "file_controller",
+        "args": {"action": "create_file", "path": path, "name": name, "content": content},
+    }
+
+
 def _build_demo_plan(user_text: str, tool_names: set[str]) -> list[dict[str, Any]]:
     """Turn a natural-language request into an ordered list of tool steps."""
     text = user_text.lower()
@@ -164,6 +218,13 @@ def _build_demo_plan(user_text: str, tool_names: set[str]) -> list[dict[str, Any
         if match:
             city = match.group(1).strip(" .")
         plan.append({"name": "weather_report", "args": {"city": city}})
+
+    creating_file = False
+    if "file_controller" in tool_names:
+        create_step = _cache_file_step(user_text)
+        if create_step:
+            plan.append(create_step)
+            creating_file = True
 
     wants_desktop_list = "desktop" in text and any(
         key in text for key in ("list", "files", "what", "show")
@@ -195,7 +256,12 @@ def _build_demo_plan(user_text: str, tool_names: set[str]) -> list[dict[str, Any
         )
     ) or ("list" in text and folder != "desktop")
     desktop_already = wants_desktop_list and "desktop_control" in tool_names
-    if "file_controller" in tool_names and wants_file_list and not desktop_already:
+    if (
+        "file_controller" in tool_names
+        and wants_file_list
+        and not desktop_already
+        and not creating_file
+    ):
         plan.append({"name": "file_controller", "args": {"action": "list", "path": folder}})
 
     wants_system = any(
@@ -209,7 +275,7 @@ def _build_demo_plan(user_text: str, tool_names: set[str]) -> list[dict[str, Any
             "how much space",
         )
     )
-    if "file_controller" in tool_names and wants_system and not wants_file_list:
+    if "file_controller" in tool_names and wants_system and not wants_file_list and not creating_file:
         plan.append(
             {"name": "file_controller", "args": {"action": "disk_usage", "path": "home"}}
         )
@@ -379,6 +445,12 @@ def _summarize_run(user_text: str, messages: list[BaseMessage]) -> str:
             else:
                 sentences.append(_first_sentence(text) or f"Showing the weather for {city}.")
             continue
+        if name == "file_controller" and str(args.get("action") or "") in ("create_file", "write"):
+            if simulated:
+                sentences.append(_first_sentence(text) or "The file was not created.")
+            else:
+                sentences.append(_first_sentence(text) or "Created the file in cache/.")
+            continue
         if name == "file_controller" and str(args.get("action") or "") == "disk_usage":
             if simulated:
                 sentences.append("The disk check stayed simulated.")
@@ -512,15 +584,23 @@ def _gated_tools_node(tools: list[BaseTool]):
 
         for tc in last_ai.tool_calls:
             name = tc.get("name") or ""
-            if not is_risky_tool(name):
+            args = tc.get("args") or {}
+            outside_cache = file_action_needs_confirmation(name, args)
+            if not is_risky_tool(name) and not outside_cache:
                 continue
 
+            message = "This action is risky. Confirm to proceed?"
+            if outside_cache:
+                message = (
+                    "This file change is outside cache/ or would overwrite a file. "
+                    "Confirming does not allow a write outside cache/."
+                )
             decision = interrupt(
                 {
                     "status": "needs_confirmation",
                     "tool_name": name,
-                    "arguments": tc.get("args") or {},
-                    "message": "This action is risky. Confirm to proceed?",
+                    "arguments": args,
+                    "message": message,
                 }
             )
             confirmed = (

@@ -214,6 +214,85 @@ def test_summary_leads_with_the_answer() -> None:
     assert "real execution" not in opened_text
 
 
+def test_cache_create_plan_and_write() -> None:
+    import asyncio
+
+    from app.agent.graph import _build_demo_plan
+    from app.bridge.executor import (
+        CACHE_DIR,
+        allows_real_execution,
+        execute_tool,
+        file_action_needs_confirmation,
+    )
+
+    plan = _build_demo_plan(
+        "create a simple hello.py in cache",
+        {"file_controller", "web_search"},
+    )
+    assert plan[0]["name"] == "file_controller"
+    assert plan[0]["args"]["path"] == "cache"
+    assert plan[0]["args"]["name"] == "hello.py"
+    assert plan[0]["args"]["action"] == "create_file"
+    assert 'print("hello")' in plan[0]["args"]["content"]
+
+    hello_world = _build_demo_plan(
+        "create a simple hello world python file in cache",
+        {"file_controller"},
+    )
+    assert hello_world[0]["args"]["name"] == "hello_world.py"
+    assert 'print("hello world")' in hello_world[0]["args"]["content"]
+    note = _build_demo_plan(
+        "create a notes.txt file in cache with a short project note",
+        {"file_controller"},
+    )
+    assert note[0]["args"]["name"] == "notes.txt"
+    assert "project note" in note[0]["args"]["content"]
+    clock = _build_demo_plan(
+        "make a basic python script in cache that prints the current time",
+        {"file_controller"},
+    )
+    assert clock[0]["args"]["name"] == "current_time.py"
+    assert "datetime" in clock[0]["args"]["content"]
+
+    outside = {"action": "create_file", "path": "desktop", "name": "hello.py", "content": "x"}
+    assert allows_real_execution("file_controller", outside) is False
+    assert file_action_needs_confirmation("file_controller", outside) is True
+    assert allows_real_execution(
+        "file_controller", {"action": "create_file", "path": "cache", "name": "run.exe"}
+    ) is False
+
+    name = "hello_test_aura.py"
+    target = CACHE_DIR / name
+    if target.exists():
+        target.unlink()
+    fresh = {
+        "action": "create_file",
+        "path": "cache",
+        "name": name,
+        "content": 'print("hello")\n',
+    }
+    assert allows_real_execution("file_controller", fresh) is True
+    assert file_action_needs_confirmation("file_controller", fresh) is False
+
+    class _Reg:
+        def get_tool(self, tool_name: str):
+            if tool_name == "file_controller":
+                return {"name": tool_name, "source": "actions/file_controller.py"}
+            return None
+
+    outcome = asyncio.run(execute_tool("file_controller", fresh, registry=_Reg()))
+    try:
+        assert outcome["success"] is True
+        assert outcome["result"]["output"] == f"Created cache/{name}"
+        assert target.read_text(encoding="utf-8") == 'print("hello")\n'
+        again = asyncio.run(execute_tool("file_controller", fresh, registry=_Reg()))
+        assert again["success"] is False
+        assert "overwrite" in again["message"]
+    finally:
+        if target.exists():
+            target.unlink()
+
+
 def test_open_tab_plan_uses_search_and_browser() -> None:
     from app.agent.graph import _build_demo_plan
 

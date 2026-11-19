@@ -25,3 +25,7 @@ Thumbs.db
 # Logs & local data
 *.log
 logs/
+
+# Generated files. cache/.gitkeep keeps the empty folder in git.
+cache/*
+!cache/.gitkeep

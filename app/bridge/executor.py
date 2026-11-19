@@ -6,9 +6,11 @@ Safe allowlist runs the real Mark-LVII handler:
   browser_control when action is go_to, search, or new_tab
   and the target is an http(s) address or a search query,
   file_controller when action is list, disk_usage, or info
-  and the path is a home shortcut (desktop, downloads, documents, …).
-Every other tool, including browser click/type/close and file
-read/write/delete, stays simulated.
+  and the path is a home shortcut (desktop, downloads, documents, …),
+  file_controller create_file/write only for a new .py, .txt, or .md
+  file inside the project cache/ folder.
+Every other tool, including browser click/type/close, overwrites,
+deletes, and writes outside cache/, stays simulated or blocked.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ import json
 import logging
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from app.api.websocket import manager
@@ -40,6 +43,13 @@ FILE_READ_ACTIONS = frozenset({"list", "disk_usage", "info"})
 FILE_SHORTCUTS = frozenset(
     {"", "desktop", "downloads", "documents", "pictures", "music", "videos", "home"}
 )
+CACHE_DIR = Path(__file__).resolve().parents[2] / "cache"
+CACHE_EXTENSIONS = frozenset({".py", ".txt", ".md"})
+CACHE_WRITE_ACTIONS = frozenset({"create_file", "write"})
+FILE_CHANGE_ACTIONS = CACHE_WRITE_ACTIONS | frozenset(
+    {"create_folder", "delete", "move", "copy", "rename", "organize_desktop"}
+)
+MAX_CACHE_FILE_BYTES = 100_000
 REAL_TIMEOUT_SECONDS = 25
 
 
@@ -73,6 +83,47 @@ def _file_shortcut(value: Any) -> bool:
     return path.lower() in FILE_SHORTCUTS
 
 
+def cache_create_path(arguments: dict[str, Any] | None) -> Path | None:
+    """A new file inside cache/, or None when the write is not allowed.
+
+    The name must be a single .py, .txt, or .md file. The path must be cache/
+    itself. Existing files are refused so a create cannot overwrite.
+    """
+    arguments = arguments or {}
+    action = str(arguments.get("action") or "").strip().lower()
+    if action not in CACHE_WRITE_ACTIONS:
+        return None
+    name = str(arguments.get("name") or arguments.get("filename") or "").strip().strip("\"'")
+    raw_path = str(arguments.get("path") or "cache").strip().strip("\"'")
+    if not name or any(mark in name for mark in ("..", "/", "\\", ":")):
+        return None
+    if any(mark in raw_path for mark in ("..", ":")):
+        return None
+    suffix = Path(name).suffix.lower()
+    if suffix not in CACHE_EXTENSIONS or not Path(name).stem:
+        return None
+    normalized = raw_path.replace("\\", "/").strip("/")
+    if normalized not in {"", "cache", f"cache/{name}"}:
+        return None
+    root = CACHE_DIR.resolve()
+    dest = (root / name).resolve()
+    if root not in dest.parents:
+        return None
+    if dest.exists():
+        return None
+    return dest
+
+
+def file_action_needs_confirmation(tool_name: str, arguments: dict[str, Any] | None) -> bool:
+    """Writes outside cache/, overwrites, and deletes need a confirmation pause."""
+    if tool_name != "file_controller":
+        return False
+    action = str((arguments or {}).get("action") or "").strip().lower()
+    if action not in FILE_CHANGE_ACTIONS:
+        return False
+    return not allows_real_execution(tool_name, arguments)
+
+
 def allows_real_execution(tool_name: str, arguments: dict[str, Any] | None) -> bool:
     """True only for the safe allowlist."""
     arguments = arguments or {}
@@ -89,6 +140,8 @@ def allows_real_execution(tool_name: str, arguments: dict[str, Any] | None) -> b
         return _http_url(arguments.get("url"))
     if tool_name == "file_controller":
         action = str(arguments.get("action") or "").strip().lower()
+        if action in CACHE_WRITE_ACTIONS:
+            return cache_create_path(arguments) is not None
         if action not in FILE_READ_ACTIONS or not _file_shortcut(arguments.get("path")):
             return False
         if action == "info":
@@ -181,6 +234,22 @@ def _invoke_handler(handler, arguments: dict[str, Any]) -> str:
     return text
 
 
+def _write_cache_file(arguments: dict[str, Any]) -> str:
+    """Create one new text file inside cache/. Refuses anything else."""
+    dest = cache_create_path(arguments)
+    if dest is None:
+        raise RuntimeError("refusing to write outside cache/ or to overwrite a file")
+    content = arguments.get("content")
+    text = "" if content is None else str(content)
+    if len(text.encode("utf-8")) > MAX_CACHE_FILE_BYTES:
+        raise RuntimeError("cache file content is too large")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(text, encoding="utf-8")
+    relative = f"cache/{dest.name}"
+    logger.info("cache file created: %s", relative)
+    return f"Created {relative}"
+
+
 def _run_real(registry: "ToolRegistry", tool: dict[str, Any], arguments: dict[str, Any]) -> str:
     handler = _load_handler(registry, tool.get("source") or "")
     return _invoke_handler(handler, arguments)
@@ -234,10 +303,20 @@ async def execute_tool(
                     arguments.get("path") or "default",
                 )
             try:
-                output = await asyncio.wait_for(
-                    asyncio.to_thread(_run_real, registry, tool, arguments),
-                    timeout=REAL_TIMEOUT_SECONDS,
+                cache_write = (
+                    tool_name == "file_controller"
+                    and str(arguments.get("action") or "").strip().lower() in CACHE_WRITE_ACTIONS
                 )
+                if cache_write:
+                    output = await asyncio.wait_for(
+                        asyncio.to_thread(_write_cache_file, arguments),
+                        timeout=REAL_TIMEOUT_SECONDS,
+                    )
+                else:
+                    output = await asyncio.wait_for(
+                        asyncio.to_thread(_run_real, registry, tool, arguments),
+                        timeout=REAL_TIMEOUT_SECONDS,
+                    )
             except Exception as exc:
                 success = False
                 logger.exception("execute_tool: tool=%s mode=real success=%s", tool_name, False)
@@ -275,18 +354,44 @@ async def execute_tool(
                     "go_to, search, and new_tab with an http(s) address"
                 )
             elif tool_name == "file_controller":
-                reason = (
-                    "simulated execution — file_controller is real only for "
-                    "list, disk_usage, and info on a home shortcut"
-                )
-            logger.info("execute_tool: tool=%s mode=simulated success=%s", tool_name, True)
+                action = str(arguments.get("action") or "").strip().lower()
+                if action in CACHE_WRITE_ACTIONS and cache_create_path(arguments) is None:
+                    name = str(arguments.get("name") or "")
+                    dest_name = Path(name).name
+                    exists = bool(dest_name) and (CACHE_DIR / dest_name).is_file()
+                    if exists and Path(dest_name).suffix.lower() in CACHE_EXTENSIONS:
+                        reason = f"blocked — refusing to overwrite cache/{dest_name}"
+                    else:
+                        reason = (
+                            "blocked — writes are only allowed for a new "
+                            ".py, .txt, or .md file inside cache/"
+                        )
+                    success = False
+                elif action in FILE_CHANGE_ACTIONS:
+                    reason = "blocked — deletes and writes outside cache/ are not run"
+                    success = False
+                else:
+                    reason = (
+                        "simulated execution — file_controller is real only for "
+                        "list, disk_usage, info, and new files inside cache/"
+                    )
+            blocked = success is False and reason.startswith("blocked")
+            if blocked:
+                mode = "blocked"
+            logger.info(
+                "execute_tool: tool=%s mode=%s success=%s",
+                tool_name,
+                "blocked" if blocked else "simulated",
+                success,
+            )
             response = {
-                "success": True,
+                "success": success,
                 "tool_name": tool_name,
                 "result": {
                     "arguments": arguments,
                     "source": tool.get("source", ""),
-                    "simulated": True,
+                    "simulated": not blocked,
+                    "blocked": blocked,
                 },
                 "message": reason,
             }
