@@ -45,6 +45,10 @@ SYSTEM_PROMPT = (
     "'new_tab' with an https URL: the first result link, or a Google search URL "
     "if there is no result link. action 'search' with a query is also fine. "
     "Do not click, type, or close tabs. "
+    "For file questions, use file_controller list or disk_usage on a home shortcut "
+    "(desktop, downloads, documents, home). Do not read, write, or delete files. "
+    "After the tools finish, answer in one or two short sentences. Lead with the "
+    "result. Do not paste raw JSON or the full tool payload. "
     "Risky tools (delete/send/shutdown/etc.) require human confirmation before they run."
 )
 
@@ -167,6 +171,49 @@ def _build_demo_plan(user_text: str, tool_names: set[str]) -> list[dict[str, Any
     if "desktop_control" in tool_names and wants_desktop_list:
         plan.append({"name": "desktop_control", "args": {"action": "list"}})
 
+    folder = "desktop"
+    if "download" in text:
+        folder = "downloads"
+    elif "document" in text:
+        folder = "documents"
+    elif "picture" in text or "photo" in text:
+        folder = "pictures"
+    elif "music" in text:
+        folder = "music"
+    elif re.search(r"\bhome\b", text):
+        folder = "home"
+    wants_file_list = any(
+        phrase in text
+        for phrase in (
+            "list files",
+            "list the files",
+            "show files",
+            "what files",
+            "files in",
+            "what's in",
+            "whats in",
+        )
+    ) or ("list" in text and folder != "desktop")
+    desktop_already = wants_desktop_list and "desktop_control" in tool_names
+    if "file_controller" in tool_names and wants_file_list and not desktop_already:
+        plan.append({"name": "file_controller", "args": {"action": "list", "path": folder}})
+
+    wants_system = any(
+        phrase in text
+        for phrase in (
+            "disk",
+            "storage",
+            "free space",
+            "disk space",
+            "system info",
+            "how much space",
+        )
+    )
+    if "file_controller" in tool_names and wants_system and not wants_file_list:
+        plan.append(
+            {"name": "file_controller", "args": {"action": "disk_usage", "path": "home"}}
+        )
+
     wants_web_search = "search" in text or "look up" in text
     if "web_search" in tool_names and wants_web_search and not wants_weather:
         query = _extract_search_query(user_text)
@@ -258,6 +305,125 @@ def _build_demo_plan(user_text: str, tool_names: set[str]) -> list[dict[str, Any
     return plan
 
 
+def _result_payload(result: Any) -> dict[str, Any]:
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except (json.JSONDecodeError, TypeError):
+            return {"output": result}
+    return result if isinstance(result, dict) else {"output": str(result)}
+
+
+def _output_text(result: Any) -> tuple[str, bool]:
+    """Return (readable output, simulated)."""
+    payload = _result_payload(result)
+    inner = payload.get("result")
+    inner = inner if isinstance(inner, dict) else payload
+    simulated = bool(inner.get("simulated"))
+    text = str(inner.get("output") or inner.get("error") or payload.get("message") or "")
+    text = re.sub(r"<<<UNTRUSTED[^>]*>>>", " ", text)
+    text = re.sub(r"<<<END UNTRUSTED>>>", " ", text)
+    return text.strip(), simulated
+
+
+def _first_sentence(text: str, limit: int = 180) -> str:
+    line = ""
+    for raw in text.splitlines():
+        if raw.strip():
+            line = raw.strip()
+            break
+    if not line:
+        return ""
+    if len(line) > limit:
+        line = line[: limit - 1].rstrip() + "…"
+    return line
+
+
+def _search_title(text: str) -> str:
+    match = re.search(r"(?m)^\s*\d+\.\s+(.{3,80})", text)
+    if not match:
+        return ""
+    title = match.group(1).strip(" .")
+    return title.split("   ")[0].strip()
+
+
+def _summarize_run(user_text: str, messages: list[BaseMessage]) -> str:
+    """One or two readable sentences from the tool results. No raw JSON."""
+    calls = _extract_tool_calls(messages)
+    if not calls:
+        return "I could not match that to a tool."
+
+    search_query = ""
+    search_text = ""
+    opened_url = ""
+    sentences: list[str] = []
+
+    for call in calls:
+        name = call.get("tool_name") or "tool"
+        args = call.get("arguments") or {}
+        text, simulated = _output_text(call.get("result"))
+        if name == "web_search":
+            search_query = str(args.get("query") or _extract_search_query(user_text))
+            search_text = text
+            continue
+        if name == "browser_control":
+            opened_url = str(args.get("url") or "")
+            if not opened_url:
+                found = re.search(r"https?://[^\s]+", text)
+                opened_url = found.group(0).rstrip(".,)") if found else ""
+            continue
+        if name == "weather_report":
+            city = str(args.get("city") or "that city")
+            if simulated:
+                sentences.append(f"The weather lookup for {city} stayed simulated.")
+            else:
+                sentences.append(_first_sentence(text) or f"Showing the weather for {city}.")
+            continue
+        if name == "file_controller" and str(args.get("action") or "") == "disk_usage":
+            if simulated:
+                sentences.append("The disk check stayed simulated.")
+            else:
+                sentences.append(_first_sentence(text) or "Checked disk space.")
+            continue
+        if name in ("file_controller", "desktop_control"):
+            where = str(args.get("path") or "desktop")
+            if simulated:
+                sentences.append(f"Listing {where} stayed simulated.")
+            else:
+                sentences.append(_first_sentence(text) or f"Listed {where}.")
+            continue
+        if simulated:
+            sentences.append(f"{name} stayed simulated.")
+        elif text:
+            sentences.append(_first_sentence(text))
+
+    if search_query and opened_url:
+        title = _search_title(search_text)
+        lead = (
+            f"Opened the top result for {search_query}: {title}."
+            if title
+            else f"Opened a tab for {search_query}."
+        )
+        summary = f"{lead} {opened_url}"
+    elif search_query:
+        title = _search_title(search_text)
+        if "no results" in search_text.lower():
+            summary = f"No web results for {search_query}."
+        elif title:
+            summary = f"Top result for {search_query}: {title}."
+        else:
+            summary = _first_sentence(search_text) or f"Searched the web for {search_query}."
+    else:
+        summary = " ".join(part for part in sentences if part).strip()
+
+    if search_query and opened_url and sentences:
+        summary = f"{summary} {' '.join(sentences)}"
+    summary = re.sub(r"\s+", " ", summary).strip()
+    if len(summary) > 420:
+        summary = summary[:419].rstrip() + "…"
+    return summary or "Done."
+
+
 def _demo_agent_node(tools: list[BaseTool]):
     tool_names = {t.name for t in tools}
 
@@ -289,9 +455,7 @@ def _demo_agent_node(tools: list[BaseTool]):
         if plan and done >= len(plan):
             return {
                 "messages": [
-                    AIMessage(
-                        content=f"Done. Completed {done} tool step(s) for: {user_text}"
-                    )
+                    AIMessage(content=_summarize_run(user_text, messages))
                 ]
             }
 

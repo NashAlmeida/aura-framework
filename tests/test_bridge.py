@@ -1,5 +1,7 @@
 """Basic bridge + agent tests (Phase 1 & 2)."""
 
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -114,6 +116,102 @@ def test_tracing_disabled_without_keys(monkeypatch) -> None:
     from app.agent.tracing import tracing_enabled
 
     assert tracing_enabled() is False
+
+
+def test_summary_leads_with_the_answer() -> None:
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+    from app.agent.graph import _summarize_run
+
+    weather = [
+        HumanMessage(content="what's the weather in Mumbai"),
+        AIMessage(
+            content="step",
+            tool_calls=[
+                {
+                    "name": "weather_report",
+                    "args": {"city": "Mumbai"},
+                    "id": "w1",
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        ToolMessage(
+            content=json.dumps(
+                {
+                    "success": True,
+                    "result": {
+                        "simulated": False,
+                        "output": "Showing the weather for Mumbai, today, sir.",
+                    },
+                    "message": "real execution",
+                }
+            ),
+            tool_call_id="w1",
+            name="weather_report",
+        ),
+    ]
+    weather_text = _summarize_run("what's the weather in Mumbai", weather)
+    assert weather_text.startswith("Showing the weather for Mumbai")
+    assert "{" not in weather_text
+
+    opened = [
+        HumanMessage(content="open new tab and search griezmann"),
+        AIMessage(
+            content="step",
+            tool_calls=[
+                {
+                    "name": "web_search",
+                    "args": {"query": "griezmann", "mode": "search"},
+                    "id": "s1",
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        ToolMessage(
+            content=json.dumps(
+                {
+                    "success": True,
+                    "result": {
+                        "simulated": False,
+                        "output": "1. Antoine Griezmann - Wikipedia\n   Source: https://en.wikipedia.org/wiki/Antoine_Griezmann",
+                    },
+                }
+            ),
+            tool_call_id="s1",
+            name="web_search",
+        ),
+        AIMessage(
+            content="step",
+            tool_calls=[
+                {
+                    "name": "browser_control",
+                    "args": {
+                        "action": "new_tab",
+                        "url": "https://en.wikipedia.org/wiki/Antoine_Griezmann",
+                    },
+                    "id": "b1",
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        ToolMessage(
+            content=json.dumps(
+                {
+                    "success": True,
+                    "result": {"simulated": False, "output": "opened"},
+                    "message": "real execution",
+                }
+            ),
+            tool_call_id="b1",
+            name="browser_control",
+        ),
+    ]
+    opened_text = _summarize_run("open new tab and search griezmann", opened)
+    assert opened_text.startswith("Opened the top result for griezmann")
+    assert "Antoine Griezmann" in opened_text
+    assert "wikipedia.org" in opened_text
+    assert "real execution" not in opened_text
 
 
 def test_open_tab_plan_uses_search_and_browser() -> None:

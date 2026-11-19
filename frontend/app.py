@@ -12,6 +12,7 @@ Run (with the backend already up):
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import threading
 import uuid
@@ -36,8 +37,19 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-if "theme" not in st.session_state:
-    st.session_state.theme = "dark"  # charcoal grey by default
+def _query_theme() -> str:
+    raw = st.query_params.get("theme", "")
+    if isinstance(raw, list):
+        raw = raw[0] if raw else ""
+    return raw if raw in ("dark", "light") else ""
+
+
+# Dark is the default. ?theme=light|dark keeps the choice across refresh.
+_saved_theme = _query_theme()
+if _saved_theme:
+    st.session_state.theme = _saved_theme
+elif "theme" not in st.session_state:
+    st.session_state.theme = "dark"
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "session_id" not in st.session_state:
@@ -58,30 +70,15 @@ DOTMATRIX = '"VT323", "Courier New", Courier, monospace'
 # ---------------------------------------------------------------------------
 
 def inject_theme_css(theme: str) -> None:
-    """Charcoal chess-board page: thin square panels, small light buttons, pixel type."""
+    """Black or white page, pixel type, square controls, hard offset shadows."""
     if theme == "light":
-        bg, panel, fg, muted, line, btn_bg, btn_fg = (
-            "#F2F2F2",
-            "#FFFFFF",
-            "#1A1A1A",
-            "#444444",
-            "#1A1A1A",
-            "#E6E6E6",
-            "#111111",
-        )
-        dots = "rgba(0,0,0,0.08)"
+        bg, panel, fg, muted, line = ("#FFFFFF", "#F7F7F7", "#000000", "#333333", "#000000")
+        btn_bg, btn_fg, shadow = ("#000000", "#FFFFFF", "#000000")
+        dots = "rgba(0,0,0,0.14)"
     else:
-        # Matches the chess app: near-black page, slightly lighter side panel.
-        bg, panel, fg, muted, line, btn_bg, btn_fg = (
-            "#1A1A1A",
-            "#2A2A2A",
-            "#E6E6E6",
-            "#9A9A9A",
-            "#C8C8C8",
-            "#E8E8E8",
-            "#111111",
-        )
-        dots = "rgba(255,255,255,0.05)"
+        bg, panel, fg, muted, line = ("#000000", "#0D0D0D", "#FFFFFF", "#C8C8C8", "#FFFFFF")
+        btn_bg, btn_fg, shadow = ("#FFFFFF", "#000000", "#FFFFFF")
+        dots = "rgba(255,255,255,0.16)"
 
     st.markdown(
         f"""
@@ -104,7 +101,7 @@ def inject_theme_css(theme: str) -> None:
             background-color: {bg} !important;
             background-image: radial-gradient({dots} 1px, transparent 1px) !important;
             background-size: 3px 3px !important;
-            border-right: 1px solid {line} !important;
+            border-right: 2px solid {line} !important;
         }}
 
         .stApp h1, .stApp h2, .stApp h3, .stApp p, .stApp label,
@@ -121,33 +118,38 @@ def inject_theme_css(theme: str) -> None:
         span[class*="material"] {{
             font-family: "Material Symbols Rounded", "Material Symbols Outlined" !important;
             font-size: 1.25rem !important;
+            font-weight: 400 !important;
+            letter-spacing: normal !important;
+            font-feature-settings: "liga" !important;
+            -webkit-font-feature-settings: "liga" !important;
             color: {fg} !important;
         }}
 
-        /* Small flat buttons, like Undo / Redo / Reset on the chess page */
+        /* Square primary buttons with a hard pixel offset, no blur */
         div.stButton > button {{
             border-radius: 0 !important;
-            border: 1px solid #111111 !important;
+            border: 2px solid {line} !important;
             background-color: {btn_bg} !important;
             color: {btn_fg} !important;
             font-family: {DOTMATRIX} !important;
-            font-size: 1.15rem !important;
-            letter-spacing: 0.02em !important;
-            box-shadow: none !important;
+            font-size: 1.2rem !important;
+            letter-spacing: 0.04em !important;
+            box-shadow: 3px 3px 0 {shadow} !important;
             padding: 0.15rem 0.7rem !important;
-            min-height: 2.1rem !important;
+            min-height: 2.2rem !important;
         }}
         div.stButton > button p,
         div.stButton > button span {{
             color: {btn_fg} !important;
             font-family: {DOTMATRIX} !important;
         }}
-        div.stButton > button:hover,
-        div.stButton > button:hover p,
-        div.stButton > button:hover span {{
-            background-color: #FFFFFF !important;
-            color: #111111 !important;
-            border-color: #111111 !important;
+        div.stButton > button:hover {{
+            transform: translate(1px, 1px);
+            box-shadow: 2px 2px 0 {shadow} !important;
+        }}
+        div.stButton > button:active {{
+            transform: translate(3px, 3px);
+            box-shadow: 0 0 0 {shadow} !important;
         }}
 
         /* One square icon for the theme switch */
@@ -174,12 +176,13 @@ def inject_theme_css(theme: str) -> None:
         }}
         [data-testid="stChatInput"] textarea {{
             border-radius: 0 !important;
-            border: 1px solid {line} !important;
+            border: 2px solid {line} !important;
             background-color: {panel} !important;
             color: {fg} !important;
             font-family: {DOTMATRIX} !important;
-            font-size: 1.15rem !important;
-            box-shadow: none !important;
+            font-size: 1.25rem !important;
+            line-height: 1.35 !important;
+            box-shadow: 3px 3px 0 {shadow} !important;
             caret-color: {fg} !important;
         }}
         [data-testid="stChatInput"] textarea::placeholder {{
@@ -190,34 +193,61 @@ def inject_theme_css(theme: str) -> None:
             border-radius: 0 !important;
             background-color: {btn_bg} !important;
             color: {btn_fg} !important;
-            border: 1px solid #111111 !important;
+            border: 2px solid {line} !important;
+            box-shadow: 3px 3px 0 {shadow} !important;
         }}
         [data-testid="stChatInputSubmitButton"] button svg {{
             fill: {btn_fg} !important;
         }}
 
         [data-testid="stChatMessage"] {{
-            border: 1px solid {line} !important;
+            border: 2px solid {line} !important;
             border-radius: 0 !important;
             background-color: {panel} !important;
-            box-shadow: none !important;
+            box-shadow: 3px 3px 0 {shadow} !important;
+            margin-bottom: 0.85rem !important;
+        }}
+        [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] p,
+        [data-testid="stChatMessage"] pre,
+        [data-testid="stChatMessage"] .aura-msg {{
+            font-family: {DOTMATRIX} !important;
+            font-size: 1.28rem !important;
+            line-height: 1.35 !important;
+            color: {fg} !important;
+            white-space: pre-wrap !important;
         }}
         [data-testid="stChatMessageAvatar"] {{
             border-radius: 0 !important;
-            border: 1px solid {line} !important;
+            border: 2px solid {line} !important;
+            background-color: {btn_bg} !important;
+        }}
+
+        [data-testid="stExpander"] details {{
+            border: 2px solid {line} !important;
+            border-radius: 0 !important;
             background-color: {panel} !important;
+            box-shadow: 3px 3px 0 {shadow} !important;
+        }}
+        [data-testid="stExpander"] summary,
+        [data-testid="stExpander"] summary span {{
+            font-family: {DOTMATRIX} !important;
+            color: {fg} !important;
         }}
 
         .aura-panel, .aura-status {{
-            border: 1px solid {line};
+            border: 2px solid {line};
             border-radius: 0;
             background: {panel};
             color: {fg};
-            box-shadow: none;
+            box-shadow: 3px 3px 0 {shadow};
             padding: 0.7rem 0.85rem;
             margin: 0.45rem 0 0.8rem 0;
             font-family: {DOTMATRIX};
-            font-size: 1.05rem;
+            font-size: 1.15rem;
+            line-height: 1.35;
+        }}
+        .aura-live {{
+            border-style: dashed;
         }}
         .aura-status .aura-muted {{
             color: {muted} !important;
@@ -291,6 +321,39 @@ def format_tool_calls(tool_calls: list[dict[str, Any]]) -> str:
 
 def append_assistant(content: str) -> None:
     st.session_state.messages.append({"role": "assistant", "content": content})
+
+
+def tool_activity_label() -> str:
+    """Sidebar / header line: RUNNING while a call is in flight or a tool started."""
+    activity = st.session_state.get("activity")
+    if activity:
+        kind = activity.get("kind")
+        if kind == "confirm":
+            return "RUNNING  CONFIRM"
+        return "RUNNING"
+    for ev in reversed(st.session_state.ws_events):
+        et = ev.get("type")
+        if et == "tool_started":
+            name = ev.get("tool_name") or "tool"
+            mode = ev.get("mode") or ""
+            return f"RUNNING  {name}  {mode}".strip()
+        if et == "tool_finished":
+            return "IDLE"
+    return "IDLE"
+
+
+def render_message(msg: dict[str, str]) -> None:
+    """Show the agent summary first. Tool payloads stay behind a square expander."""
+    content = msg.get("content") or ""
+    summary, sep, detail = content.partition("\n--- tool calls ---")
+    with st.chat_message(msg["role"]):
+        st.markdown(
+            f'<div class="aura-msg">{html.escape(summary.strip() or "(empty)")}</div>',
+            unsafe_allow_html=True,
+        )
+        if sep and detail.strip():
+            with st.expander("TOOL CALLS"):
+                st.text(detail.strip())
 
 
 def handle_agent_result(data: dict[str, Any]) -> None:
@@ -385,16 +448,21 @@ with st.sidebar:
     with side_icon:
         icon = "☀" if st.session_state.theme == "dark" else "☾"
         if st.button(icon, key="theme_icon", help="Switch dark / light"):
-            st.session_state.theme = "light" if st.session_state.theme == "dark" else "dark"
+            nxt = "light" if st.session_state.theme == "dark" else "dark"
+            st.session_state.theme = nxt
+            st.query_params["theme"] = nxt
             st.rerun()
 
     healthy = backend_healthy()
     state = "ONLINE" if healthy else "OFFLINE"
+    activity_line = tool_activity_label()
+    live_class = " aura-live" if activity_line.startswith("RUNNING") else ""
     st.markdown(
         (
-            '<div class="aura-status">'
-            "STATUS<br/>"
+            f'<div class="aura-status{live_class}">'
+            f"THEME {st.session_state.theme.upper()}<br/>"
             f"BACKEND {state}<br/>"
+            f"TOOLS {activity_line}<br/>"
             f'<span class="aura-muted">SESSION {st.session_state.session_id[:8]}</span>'
             "</div>"
         ),
@@ -414,13 +482,16 @@ with st.sidebar:
             et = ev.get("type", "?")
             if et in ("tool_started", "tool_finished"):
                 lines.append(
-                    f"{et} · {ev.get('tool_name', '')} · mode={ev.get('mode', '')}"
-                    f" · success={ev.get('success', '')}"
+                    f"{html.escape(et)} · {html.escape(str(ev.get('tool_name', '')))}"
+                    f" · mode={html.escape(str(ev.get('mode', '')))}"
+                    f" · success={html.escape(str(ev.get('success', '')))}"
                 )
             elif et == "connected":
-                lines.append(f"connected · {ev.get('message', '')}")
+                lines.append(f"connected · {html.escape(str(ev.get('message', '')))}")
             else:
-                lines.append(f"{et} · {ev.get('message', ev)}")
+                lines.append(
+                    f"{html.escape(str(et))} · {html.escape(str(ev.get('message', ev)))}"
+                )
         st.markdown(
             '<div class="aura-status">' + "<br/>".join(lines) + "</div>",
             unsafe_allow_html=True,
@@ -439,56 +510,62 @@ st.markdown(
     '<p class="aura-sub">CHAT // BRIDGE @ 127.0.0.1:8000</p>',
     unsafe_allow_html=True,
 )
+main_live = " aura-live" if activity_line.startswith("RUNNING") else ""
+st.markdown(
+    f'<div class="aura-status{main_live}">TOOLS  {html.escape(activity_line)}</div>',
+    unsafe_allow_html=True,
+)
 
 for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.text(msg["content"])
+    render_message(msg)
 
 # Confirmation controls (square Confirm / Cancel)
 pending = st.session_state.pending_confirmation
-if pending:
+activity = st.session_state.get("activity")
+if pending and not activity:
     st.markdown(
         (
             '<div class="aura-panel">RISKY ACTION<br/>'
-            f"TOOL {pending['tool_name']}<br/>"
-            f"ARGS {json.dumps(pending['arguments'])}<br/>"
-            f"{pending['message']}</div>"
+            f"TOOL {html.escape(str(pending['tool_name']))}<br/>"
+            f"ARGS {html.escape(json.dumps(pending['arguments']))}<br/>"
+            f"{html.escape(str(pending['message']))}</div>"
         ),
         unsafe_allow_html=True,
     )
     col_ok, col_no = st.columns(2)
     with col_ok:
         if st.button("CONFIRM", use_container_width=True, key="confirm_yes"):
-            try:
-                data = call_agent(confirmed=True)
-                handle_agent_result(data)
-            except Exception as exc:
-                append_assistant(f"[ERROR] confirmation failed: {exc}")
+            st.session_state.activity = {"kind": "confirm", "confirmed": True}
             st.rerun()
     with col_no:
         if st.button("CANCEL", use_container_width=True, key="confirm_no"):
-            try:
-                data = call_agent(confirmed=False)
-                handle_agent_result(data)
-            except Exception as exc:
-                append_assistant(f"[ERROR] cancel failed: {exc}")
-                st.session_state.pending_confirmation = None
+            st.session_state.activity = {"kind": "confirm", "confirmed": False}
             st.rerun()
 
-# Chat input (disabled while waiting for confirmation)
+# Chat input (disabled while a tool is running or waiting for confirmation)
 prompt = st.chat_input(
     "type a command…",
-    disabled=pending is not None or not healthy,
+    disabled=pending is not None or activity is not None or not healthy,
 )
 
-if prompt:
+if prompt and not activity:
     st.session_state.messages.append({"role": "user", "content": prompt})
+    st.session_state.activity = {"kind": "message", "text": prompt}
+    st.rerun()
+
+if activity:
     try:
-        data = call_agent(message=prompt)
+        if activity.get("kind") == "confirm":
+            data = call_agent(confirmed=bool(activity.get("confirmed")))
+        else:
+            data = call_agent(message=activity.get("text"))
         handle_agent_result(data)
     except Exception as exc:
         append_assistant(
             f"[ERROR] could not reach agent: {exc}\n"
             "Is the backend running?  python -m uvicorn app.main:app --port 8000"
         )
+        if activity.get("kind") == "confirm":
+            st.session_state.pending_confirmation = None
+    st.session_state.activity = None
     st.rerun()

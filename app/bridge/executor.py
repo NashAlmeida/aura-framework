@@ -4,8 +4,11 @@ Safe allowlist runs the real Mark-LVII handler:
   weather_report, web_search,
   desktop_control when action=list,
   browser_control when action is go_to, search, or new_tab
-  and the target is an http(s) address or a search query.
-Every other tool, including browser click/type/close, stays simulated.
+  and the target is an http(s) address or a search query,
+  file_controller when action is list, disk_usage, or info
+  and the path is a home shortcut (desktop, downloads, documents, …).
+Every other tool, including browser click/type/close and file
+read/write/delete, stays simulated.
 """
 
 from __future__ import annotations
@@ -33,6 +36,10 @@ _UNSAFE_NAME_MARKERS = ("..", "/", "\\")
 # are special-cased so only their read-or-open actions run.
 REAL_TOOL_NAMES = frozenset({"weather_report", "web_search"})
 BROWSER_OPEN_ACTIONS = frozenset({"go_to", "search", "new_tab"})
+FILE_READ_ACTIONS = frozenset({"list", "disk_usage", "info"})
+FILE_SHORTCUTS = frozenset(
+    {"", "desktop", "downloads", "documents", "pictures", "music", "videos", "home"}
+)
 REAL_TIMEOUT_SECONDS = 25
 
 
@@ -58,6 +65,14 @@ def _http_url(value: Any) -> bool:
     return url.startswith("https://") or url.startswith("http://")
 
 
+def _file_shortcut(value: Any) -> bool:
+    """Allow only named home folders, not absolute paths or traversal."""
+    path = str(value or "").strip().strip("\"'")
+    if any(mark in path for mark in ("..", "/", "\\", ":")):
+        return False
+    return path.lower() in FILE_SHORTCUTS
+
+
 def allows_real_execution(tool_name: str, arguments: dict[str, Any] | None) -> bool:
     """True only for the safe allowlist."""
     arguments = arguments or {}
@@ -72,6 +87,15 @@ def allows_real_execution(tool_name: str, arguments: dict[str, Any] | None) -> b
         if action == "search":
             return bool(str(arguments.get("query") or "").strip())
         return _http_url(arguments.get("url"))
+    if tool_name == "file_controller":
+        action = str(arguments.get("action") or "").strip().lower()
+        if action not in FILE_READ_ACTIONS or not _file_shortcut(arguments.get("path")):
+            return False
+        if action == "info":
+            name = str(arguments.get("name") or "").strip()
+            if not name or any(mark in name for mark in ("/", "\\", ":", "..")):
+                return False
+        return True
     return False
 
 
@@ -203,6 +227,12 @@ async def execute_tool(
                     arguments.get("query") or "",
                     arguments.get("browser") or "default",
                 )
+            elif tool_name == "file_controller":
+                logger.info(
+                    "file tool running for real: action=%s path=%s",
+                    arguments.get("action"),
+                    arguments.get("path") or "default",
+                )
             try:
                 output = await asyncio.wait_for(
                     asyncio.to_thread(_run_real, registry, tool, arguments),
@@ -243,6 +273,11 @@ async def execute_tool(
                 reason = (
                     "simulated execution — browser_control is real only for "
                     "go_to, search, and new_tab with an http(s) address"
+                )
+            elif tool_name == "file_controller":
+                reason = (
+                    "simulated execution — file_controller is real only for "
+                    "list, disk_usage, and info on a home shortcut"
                 )
             logger.info("execute_tool: tool=%s mode=simulated success=%s", tool_name, True)
             response = {

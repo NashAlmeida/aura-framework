@@ -14,8 +14,13 @@ import pytest
 from app.bridge.executor import execute_tool
 from app.bridge.tool_registry import ToolRegistry
 
-# web-agent-bridge/tests/ -> workspace root -> mark_lvii/mark_lvii
-CLONE = Path(__file__).resolve().parents[2] / "mark_lvii" / "mark_lvii"
+# The clone has lived in two places: mark_lvii/mark_lvii and "New folder"/mark_lvii.
+_ROOT = Path(__file__).resolve().parents[2]
+_CANDIDATES = (
+    _ROOT / "mark_lvii" / "mark_lvii",
+    _ROOT / "New folder" / "mark_lvii",
+)
+CLONE = next((path for path in _CANDIDATES if (path / "actions").is_dir()), _CANDIDATES[0])
 
 
 pytestmark = pytest.mark.skipif(
@@ -61,6 +66,21 @@ def test_simulated_dry_run_of_simple_tools() -> None:
     ) is False
     assert allows_real_execution(
         "browser_control", {"action": "new_tab", "url": "file:///C:/Windows"}
+    ) is False
+    assert allows_real_execution(
+        "file_controller", {"action": "list", "path": "downloads"}
+    ) is True
+    assert allows_real_execution(
+        "file_controller", {"action": "disk_usage", "path": "home"}
+    ) is True
+    assert allows_real_execution(
+        "file_controller", {"action": "read", "path": "desktop", "name": "notes.txt"}
+    ) is False
+    assert allows_real_execution(
+        "file_controller", {"action": "delete", "path": "desktop", "name": "notes.txt"}
+    ) is False
+    assert allows_real_execution(
+        "file_controller", {"action": "list", "path": "C:/Windows"}
     ) is False
 
     registry = ToolRegistry(CLONE)
